@@ -1,0 +1,23 @@
+--- /mnt/data/desmond_gmxMMPBSA_wx_v7_1_1/desmond_gmxmmpbsa_wx.py	2026-07-28 13:38:06.578890409 +0000
++++ /mnt/data/desmond_gmxMMPBSA_wx_v7_1_2/desmond_gmxmmpbsa_wx.py	2026-07-28 13:45:38.662906577 +0000
+@@ -39,7 +39,7 @@
+     raise SystemExit(1) from exc
+ 
+ 
+-GUI_VERSION = "1.0.1"
++GUI_VERSION = "1.0.2"
+ ENGINE_VERSION = "7.1.0"
+ APP_TITLE = "Desmond → gmx_MMPBSA"
+ CONFIG_DIR = Path.home() / ".config" / "desmond_gmxmmpbsa_wx"
+@@ -630,9 +630,9 @@
+             wildcard="gmx_MMPBSA result (*.dat)|*.dat|All files (*.*)|*.*",
+             dialog_title="Select FINAL_RESULTS_MMPBSA.dat",
+         )
+-        self.parse_result_button = wx.Button(panel, label="Parse result")
+-        self.open_result_button = wx.Button(panel, label="Open result file")
+         result_actions = wx.Panel(panel)
++        self.parse_result_button = wx.Button(result_actions, label="Parse result")
++        self.open_result_button = wx.Button(result_actions, label="Open result file")
+         action_sizer = wx.BoxSizer(wx.HORIZONTAL)
+         action_sizer.Add(self.parse_result_button, 0, wx.RIGHT, 7)
+         action_sizer.Add(self.open_result_button, 0)

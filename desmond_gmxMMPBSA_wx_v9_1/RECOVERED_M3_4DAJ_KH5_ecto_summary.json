@@ -1,0 +1,19 @@
+{
+  "source": "wx_gui_run.log in uploaded LIG_mmpbsa archive",
+  "run_timestamp": "2026-07-30 16:03:24",
+  "system": "M3 4DAJ / KH-5-R ectopic pose",
+  "solvent_model": "PB",
+  "frames": 101,
+  "trajectory_stride": 10,
+  "force_field": "Amber ff19SB + GAFF2",
+  "entropy_included": false,
+  "matched_label": "ΔTOTAL",
+  "delta_total_kcal_per_mol": {
+    "average": -24.02,
+    "standard_deviation_propagated": 5.35,
+    "standard_deviation": 4.41,
+    "standard_error_propagated": 0.53,
+    "standard_error": 0.44
+  },
+  "note": "The original FINAL_RESULTS files were subsequently removed or overwritten by later reruns in the same work directory; this summary is recovered from the persistent GUI log."
+}

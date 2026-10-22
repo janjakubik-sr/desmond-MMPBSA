@@ -26,6 +26,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
+import remote_alkyone
+
 try:
     import wx
 except ImportError as exc:  # pragma: no cover - depends on the desktop system
@@ -40,7 +42,7 @@ except ImportError as exc:  # pragma: no cover - depends on the desktop system
     raise SystemExit(1) from exc
 
 
-GUI_VERSION = "1.0.6"
+GUI_VERSION = "1.2.0"
 ENGINE_VERSION = "9.1.0"
 APP_TITLE = "Desmond → gmx_MMPBSA"
 CONFIG_DIR = Path.home() / ".config" / "desmond_gmxmmpbsa_wx"
@@ -60,6 +62,29 @@ COMMON_NONLIGAND = AA_NAMES | {
 }
 
 FLOAT_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?"
+
+ENV_CHECK_SCRIPT = r'''
+import importlib.util
+import shutil
+import sys
+
+modules = ["numpy", "scipy", "mdtraj", "networkx", "parmed"]
+programs = ["gmx", "gmx_MMPBSA", "parmchk2", "tleap", "antechamber", "mpirun"]
+failed = False
+print("Python:", sys.executable)
+print("Version:", sys.version.replace("\\n", " "))
+print("\\nPython modules")
+for name in modules:
+    ok = importlib.util.find_spec(name) is not None
+    print(f"  {name:14s} {'OK' if ok else 'MISSING'}")
+    failed |= not ok
+print("\\nExecutables")
+for name in programs:
+    path = shutil.which(name)
+    print(f"  {name:14s} {path or 'MISSING'}")
+    failed |= path is None
+raise SystemExit(2 if failed else 0)
+'''
 
 
 def parse_binding_energy(result_file: Path) -> dict[str, Any]:
@@ -454,11 +479,8 @@ class MainFrame(wx.Frame):
         self.SetMinSize((900, 680))
         self.engine_default = Path(__file__).resolve().parent / "app" / "desmond_gmxmmpbsa.py"
         self.ffxml_default = Path(__file__).resolve().parent / "app" / "protein.ff19SB.xml"
-        self.process: subprocess.Popen[str] | None = None
-        self.process_thread: threading.Thread | None = None
-        self.process_task = ""
-        self.process_log_handle: Any = None
-        self.stop_requested = False
+        self.processes: list[dict[str, Any]] = []
+        self.process_seq = 0
         self.last_workdir: Path | None = None
         self.last_result: Path | None = None
 
@@ -531,10 +553,11 @@ class MainFrame(wx.Frame):
         self.CreateStatusBar()
         self.SetStatusText("Ready")
         self._build_menu()
-        self.stop_button.Disable()
+        self.update_controls()
         self.open_folder_button.Disable()
 
         self.run_button.Bind(wx.EVT_BUTTON, self.on_run)
+        self.run_remote.Bind(wx.EVT_CHECKBOX, lambda _evt: self.update_controls())
         self.stop_button.Bind(wx.EVT_BUTTON, self.on_stop)
         self.check_button.Bind(wx.EVT_BUTTON, self.on_check_environment)
         self.show_command_button.Bind(wx.EVT_BUTTON, self.on_show_command)
@@ -593,6 +616,9 @@ class MainFrame(wx.Frame):
 
         self.mode_choice = wx.Choice(panel, choices=[label for label, _ in self.MODES])
         self.mode_choice.SetSelection(0)
+        self.run_remote = wx.CheckBox(
+            panel, label="Run on a remote server via Slurm (copy to scratch, sbatch, copy back)"
+        )
         self.workdir = PathField(panel, kind="dir", dialog_title="Select work/output directory")
         self.gro_file = PathField(
             panel,
@@ -644,6 +670,7 @@ class MainFrame(wx.Frame):
 
         rows = [
             ("Operation", self.mode_choice),
+            ("Remote execution", self.run_remote),
             ("Work/output directory", self.workdir),
             ("Full-system GRO", self.gro_file),
             ("Full-system XTC", self.xtc_file),
@@ -710,6 +737,12 @@ class MainFrame(wx.Frame):
         self.extra_arguments = wx.TextCtrl(panel)
         self.extra_arguments.SetHint("Optional expert CLI arguments")
 
+        self.remote_host = wx.TextCtrl(panel, value=remote_alkyone.HOST_DEFAULT)
+        self.remote_partition = wx.TextCtrl(panel, value=remote_alkyone.PARTITION_DEFAULT)
+        self.remote_walltime = wx.TextCtrl(panel, value=remote_alkyone.WALLTIME_DEFAULT)
+        self.remote_scratch = wx.TextCtrl(panel, value=remote_alkyone.SCRATCH_BASE_DEFAULT)
+        self.remote_conda = wx.TextCtrl(panel, value=remote_alkyone.REMOTE_CONDA_DEFAULT)
+
         rows = [
             ("MDTraj chunk size", self.chunk_size),
             ("Ligand charges", self.preserve_ligand_charges),
@@ -721,6 +754,11 @@ class MainFrame(wx.Frame):
             ("Python execution", self.use_current_python),
             ("Workflow engine", self.engine_file),
             ("Additional arguments", self.extra_arguments),
+            ("Remote SSH host", self.remote_host),
+            ("Remote Slurm partition", self.remote_partition),
+            ("Remote Slurm walltime", self.remote_walltime),
+            ("Remote scratch base", self.remote_scratch),
+            ("Remote conda executable", self.remote_conda),
         ]
         for label, control in rows:
             text = wx.StaticText(panel, label=label)
@@ -801,6 +839,26 @@ class MainFrame(wx.Frame):
         selection = self.mode_choice.GetSelection()
         return self.MODES[selection][1]
 
+    def remote_active(self) -> bool:
+        return self.run_remote.GetValue() and self.current_mode() in {"all", "run"}
+
+    def local_workflow_running(self) -> bool:
+        return any(
+            p["task"] == "workflow" and not p["is_remote"] for p in self.processes
+        )
+
+    def update_controls(self) -> None:
+        running = bool(self.processes)
+        if running:
+            # A further run is allowed only for remote submissions while
+            # no local workflow occupies this machine.
+            allowed = self.remote_active() and not self.local_workflow_running()
+        else:
+            allowed = True
+        self.run_button.Enable(allowed)
+        self.check_button.Enable(not running)
+        self.stop_button.Enable(running)
+
     def settings_dict(self) -> dict[str, Any]:
         return {
             "mode": self.current_mode(),
@@ -824,6 +882,12 @@ class MainFrame(wx.Frame):
             "engine": self.engine_file.get(),
             "extra_arguments": self.extra_arguments.GetValue(),
             "result_file": self.result_file.get(),
+            "run_remote": self.run_remote.GetValue(),
+            "remote_host": self.remote_host.GetValue().strip(),
+            "remote_partition": self.remote_partition.GetValue().strip(),
+            "remote_walltime": self.remote_walltime.GetValue().strip(),
+            "remote_scratch": self.remote_scratch.GetValue().strip(),
+            "remote_conda": self.remote_conda.GetValue().strip(),
         }
 
     def apply_settings(self, data: dict[str, Any]) -> None:
@@ -858,6 +922,17 @@ class MainFrame(wx.Frame):
         self.engine_file.set(data.get("engine", self.engine_default))
         self.extra_arguments.SetValue(str(data.get("extra_arguments", "")))
         self.result_file.set(data.get("result_file", ""))
+        self.run_remote.SetValue(bool(data.get("run_remote", False)))
+        self.remote_host.SetValue(
+            str(data.get("remote_host", remote_alkyone.HOST_DEFAULT)))
+        self.remote_partition.SetValue(
+            str(data.get("remote_partition", remote_alkyone.PARTITION_DEFAULT)))
+        self.remote_walltime.SetValue(
+            str(data.get("remote_walltime", remote_alkyone.WALLTIME_DEFAULT)))
+        self.remote_scratch.SetValue(
+            str(data.get("remote_scratch", remote_alkyone.SCRATCH_BASE_DEFAULT)))
+        self.remote_conda.SetValue(
+            str(data.get("remote_conda", remote_alkyone.REMOTE_CONDA_DEFAULT)))
         self.on_mode_changed(None)
 
     def save_settings(self) -> None:
@@ -901,6 +976,7 @@ class MainFrame(wx.Frame):
         self.ffxml_file.enable(prepare_inputs)
         self.mpi_processes.Enable(mode in {"all", "run"})
         self.workdir.enable(mode != "summarize")
+        self.run_remote.Enable(mode in {"all", "run"})
         if mode == "all":
             self.run_button.SetLabel("Run complete workflow")
         elif mode == "prepare":
@@ -910,6 +986,7 @@ class MainFrame(wx.Frame):
         else:
             self.run_button.SetLabel("Summarize result")
             self.notebook.SetSelection(2)
+        self.update_controls()
         self.Layout()
 
     def on_input_path_changed(self, _event: wx.CommandEvent) -> None:
@@ -972,8 +1049,15 @@ class MainFrame(wx.Frame):
             wx.MessageBox(str(exc), "Ligand detection failed", wx.OK | wx.ICON_ERROR)
 
     def on_run(self, _event: wx.CommandEvent) -> None:
-        if self.process is not None:
-            wx.MessageBox("A process is already running.", APP_TITLE, wx.OK | wx.ICON_WARNING)
+        if self.processes and not (
+            self.remote_active() and not self.local_workflow_running()
+        ):
+            wx.MessageBox(
+                "Another process is already running. Only remote "
+                "submissions may run concurrently.",
+                APP_TITLE,
+                wx.OK | wx.ICON_WARNING,
+            )
             return
         mode = self.current_mode()
         if mode == "summarize":
@@ -998,17 +1082,37 @@ class MainFrame(wx.Frame):
         workdir.mkdir(parents=True, exist_ok=True)
         self.last_workdir = workdir
         self.result_file.set(workdir / "FINAL_RESULTS_MMPBSA.dat")
+        is_remote = self.remote_active()
+        if is_remote:
+            try:
+                command = self.build_remote_command(command, workdir, mode)
+                cwd = workdir
+            except Exception as exc:
+                wx.MessageBox(
+                    str(exc), "Remote submission setup failed", wx.OK | wx.ICON_ERROR
+                )
+                return
         try:
-            self.start_process(command, cwd, "workflow", workdir / "wx_gui_run.log")
+            self.start_process(
+                command,
+                cwd,
+                "workflow",
+                workdir / "wx_gui_run.log",
+                workdir=workdir,
+                is_remote=is_remote,
+            )
         except Exception as exc:
             wx.MessageBox(str(exc), "Could not start workflow", wx.OK | wx.ICON_ERROR)
 
     def on_check_environment(self, _event: wx.CommandEvent | None) -> None:
-        if self.process is not None:
+        if self.processes:
             wx.MessageBox("A process is already running.", APP_TITLE, wx.OK | wx.ICON_WARNING)
             return
         try:
-            command = self.environment_check_command()
+            if self.remote_active():
+                command = self.remote_environment_check_command()
+            else:
+                command = self.environment_check_command()
         except Exception as exc:
             wx.MessageBox(str(exc), "Environment check", wx.OK | wx.ICON_ERROR)
             return
@@ -1022,8 +1126,11 @@ class MainFrame(wx.Frame):
             if self.current_mode() == "summarize":
                 text = f"Internal parser: {self.result_file.get()}"
             else:
-                command, cwd, _workdir = self.build_engine_command(validate_paths=False)
-                text = f"Working directory:\n{cwd}\n\nCommand:\n{format_command(command)}"
+                command, cwd, workdir = self.build_engine_command(validate_paths=False)
+                if self.remote_active():
+                    text = self.remote_summary_text(command, cwd, workdir)
+                else:
+                    text = f"Working directory:\n{cwd}\n\nCommand:\n{format_command(command)}"
             dialog = wx.MessageDialog(self, text, "Command preview", wx.OK | wx.ICON_INFORMATION)
             dialog.SetSize((900, 400))
             with dialog:
@@ -1032,30 +1139,68 @@ class MainFrame(wx.Frame):
             wx.MessageBox(str(exc), "Command preview", wx.OK | wx.ICON_ERROR)
 
     def on_stop(self, _event: wx.CommandEvent) -> None:
-        if self.process is None:
+        if not self.processes:
             return
-        self.stop_requested = True
-        self.append_log("\n[GUI] Termination requested.\n")
-        try:
-            if os.name == "posix":
-                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-            else:  # pragma: no cover
-                self.process.terminate()
-        except ProcessLookupError:
-            pass
+        self.append_log("\n[GUI] Termination requested for all running processes.\n")
+        for record in list(self.processes):
+            record["stop_requested"] = True
+            self.cancel_remote_job(record)
+            popen = record["popen"]
+            if popen.poll() is not None:
+                continue
+            try:
+                if os.name == "posix":
+                    os.killpg(os.getpgid(popen.pid), signal.SIGTERM)
+                else:  # pragma: no cover
+                    popen.terminate()
+            except ProcessLookupError:
+                pass
         wx.CallLater(5000, self.force_kill_if_running)
 
-    def force_kill_if_running(self) -> None:
-        if self.process is None or self.process.poll() is not None:
+    def cancel_remote_job(self, record: dict[str, Any]) -> None:
+        job_id = record.get("remote_job_id")
+        if not job_id:
             return
-        self.append_log("[GUI] Process did not terminate; sending SIGKILL.\n")
-        try:
-            if os.name == "posix":
-                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-            else:  # pragma: no cover
-                self.process.kill()
-        except ProcessLookupError:
-            pass
+        host = self.remote_host.GetValue().strip()
+        self.append_log(f"[GUI] Cancelling Slurm job {job_id} on {host} ...\n")
+
+        def _cancel() -> None:
+            try:
+                subprocess.run(
+                    [
+                        "ssh",
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ConnectTimeout=15",
+                        host,
+                        "scancel",
+                        job_id,
+                    ],
+                    timeout=30,
+                    capture_output=True,
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=_cancel, daemon=True).start()
+
+    def force_kill_if_running(self) -> None:
+        for record in list(self.processes):
+            popen = record["popen"]
+            if popen.poll() is not None:
+                continue
+            self.append_log(
+                f"[GUI] Process [#{record['seq']}] did not terminate; "
+                "sending SIGKILL.\n"
+            )
+            try:
+                if os.name == "posix":
+                    os.killpg(os.getpgid(popen.pid), signal.SIGKILL)
+                else:  # pragma: no cover
+                    popen.kill()
+            except ProcessLookupError:
+                pass
 
     def on_parse_result(self, _event: wx.CommandEvent | None) -> None:
         try:
@@ -1134,7 +1279,10 @@ class MainFrame(wx.Frame):
             f"GUI version: {GUI_VERSION}\n"
             f"Bundled workflow engine: {ENGINE_VERSION}\n\n"
             "Runs the validated Desmond GRO/XTC → ff19SB/GAFF2 → "
-            "gmx_MMPBSA single-trajectory workflow in a Conda environment.\n\n"
+            "gmx_MMPBSA single-trajectory workflow in a Conda environment.\n"
+            "Calculations can optionally be submitted to a remote server "
+            "via Slurm (staging to /scratch and copy-back to the mounted "
+            "data directory are handled automatically).\n\n"
             "The GUI itself can use Debian/Ubuntu's system wxPython; the "
             "scientific calculation remains isolated in the selected Conda environment.",
             "About",
@@ -1142,9 +1290,10 @@ class MainFrame(wx.Frame):
         )
 
     def on_close(self, event: wx.CloseEvent) -> None:
-        if self.process is not None and self.process.poll() is None:
+        if self.processes:
             answer = wx.MessageBox(
-                "A calculation is still running. Stop it and close the application?",
+                "One or more calculations are still running. Stop them and "
+                "close the application?",
                 APP_TITLE,
                 wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING,
             )
@@ -1262,28 +1411,7 @@ class MainFrame(wx.Frame):
         return command, cwd, workdir
 
     def environment_check_command(self) -> list[str]:
-        script = r'''
-import importlib.util
-import shutil
-import sys
-
-modules = ["numpy", "scipy", "mdtraj", "networkx", "parmed"]
-programs = ["gmx", "gmx_MMPBSA", "parmchk2", "tleap", "antechamber", "mpirun"]
-failed = False
-print("Python:", sys.executable)
-print("Version:", sys.version.replace("\\n", " "))
-print("\\nPython modules")
-for name in modules:
-    ok = importlib.util.find_spec(name) is not None
-    print(f"  {name:14s} {'OK' if ok else 'MISSING'}")
-    failed |= not ok
-print("\\nExecutables")
-for name in programs:
-    path = shutil.which(name)
-    print(f"  {name:14s} {path or 'MISSING'}")
-    failed |= path is None
-raise SystemExit(2 if failed else 0)
-'''
+        script = ENV_CHECK_SCRIPT
         if self.use_current_python.GetValue():
             return [sys.executable, "-u", "-c", script]
         conda_text = self.conda_file.get()
@@ -1305,6 +1433,88 @@ raise SystemExit(2 if failed else 0)
             script,
         ]
 
+    def remote_fields(self) -> dict[str, str]:
+        return {
+            "host": self.remote_host.GetValue().strip(),
+            "partition": self.remote_partition.GetValue().strip(),
+            "walltime": self.remote_walltime.GetValue().strip(),
+            "scratch_base": self.remote_scratch.GetValue().strip(),
+            "conda": self.remote_conda.GetValue().strip(),
+        }
+
+    def build_remote_command(
+        self, local_command: list[str], workdir: Path, mode: str
+    ) -> list[str]:
+        """Generate the submission scripts and return the local driver call."""
+        if self.use_current_python.GetValue():
+            raise ValueError(
+                "'Use the Python/environment that launched this GUI' cannot be "
+                "honoured on the remote server; uncheck it so the remote "
+                "conda environment is used."
+            )
+        conda_env = self.conda_env.GetValue().strip()
+        if not conda_env:
+            raise ValueError("Specify the Conda environment name.")
+        fields = self.remote_fields()
+        engine = Path(self.engine_file.get()).expanduser().resolve()
+        driver = remote_alkyone.write_remote_scripts(
+            workdir,
+            mode=mode,
+            local_command=local_command,
+            engine_file=engine,
+            result_dir=workdir,
+            host=fields["host"],
+            partition=fields["partition"],
+            walltime=fields["walltime"],
+            scratch_base=fields["scratch_base"],
+            conda=fields["conda"],
+            conda_env=conda_env,
+            cpus=self.mpi_processes.GetValue(),
+        )
+        return ["bash", str(driver)]
+
+    def remote_environment_check_command(self) -> list[str]:
+        fields = self.remote_fields()
+        remote_alkyone.validate_remote_fields(**fields)
+        environment = self.conda_env.GetValue().strip()
+        if not environment:
+            raise ValueError("Specify the Conda environment name.")
+        probe = (
+            'echo "[REMOTE] Executables on $(hostname):"; '
+            "for p in gmx sbatch squeue sacct; do "
+            "printf '  %-10s %s\\n' \"$p\" \"$(command -v $p || echo MISSING)\"; "
+            "done; "
+            f"{fields['conda']} run --no-capture-output -n "
+            f"{shlex.quote(environment)} python -u -c "
+            f"{shlex.quote(ENV_CHECK_SCRIPT)}"
+        )
+        return [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=15",
+            fields["host"],
+            probe,
+        ]
+
+    def remote_summary_text(self, command: list[str], cwd: Path, workdir: Path) -> str:
+        fields = self.remote_fields()
+        return (
+            f"Remote execution on {fields['host']} via Slurm\n\n"
+            f"Partition:  {fields['partition']}\n"
+            f"Walltime:   {fields['walltime']}\n"
+            f"CPUs:       {self.mpi_processes.GetValue()}\n"
+            f"Scratch:    {fields['scratch_base']}/wxmmpbsa_XXXXXXXXXX\n"
+            f"Remote env: {fields['conda']} run -n {self.conda_env.GetValue().strip()}\n\n"
+            f"Inputs and the engine are staged to scratch; results are copied "
+            f"back to:\n{workdir}\n\n"
+            f"Local driver command:\n{format_command(command)}\n\n"
+            f"Generated scripts:\n"
+            f"  {workdir / remote_alkyone.DRIVER_SCRIPT_NAME}\n"
+            f"  {workdir / remote_alkyone.JOB_SCRIPT_NAME}"
+        )
+
     # ------------------------------ subprocess management ----------------
 
     def start_process(
@@ -1313,38 +1523,35 @@ raise SystemExit(2 if failed else 0)
         cwd: Path,
         task: str,
         log_path: Path | None,
+        workdir: Path | None = None,
+        is_remote: bool = False,
     ) -> None:
-        self.process_task = task
-        self.stop_requested = False
+        self.process_seq += 1
+        seq = self.process_seq
         self.progress.SetValue(0)
-        self.status_text.SetLabel("Starting…")
+        self.status_text.SetLabel(f"Starting [#{seq}] …")
         self.SetStatusText("Starting process")
-        self.run_button.Disable()
-        self.check_button.Disable()
-        self.stop_button.Enable()
         self.open_folder_button.Enable(bool(self.workdir.get()))
-        self.append_log(
+        header = (
             "\n" + "=" * 88 + "\n"
-            + f"[GUI] {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            + f"[GUI] cwd: {cwd}\n"
-            + f"[GUI] command: {format_command(command)}\n"
+            + f"[GUI] [#{seq}] {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            + f"[GUI] [#{seq}] cwd: {cwd}\n"
+            + f"[GUI] [#{seq}] command: {format_command(command)}\n"
             + "=" * 88 + "\n"
         )
+        self.append_log(header)
 
+        log_handle: Any = None
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            self.process_log_handle = log_path.open("at", encoding="utf-8")
-            self.process_log_handle.write(
-                f"\n[GUI] {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"[GUI] cwd: {cwd}\n"
-                f"[GUI] command: {format_command(command)}\n"
-            )
-            self.process_log_handle.flush()
+            log_handle = log_path.open("at", encoding="utf-8")
+            log_handle.write(header)
+            log_handle.flush()
 
         environment = os.environ.copy()
         environment["PYTHONUNBUFFERED"] = "1"
         try:
-            self.process = subprocess.Popen(
+            popen = subprocess.Popen(
                 command,
                 cwd=str(cwd),
                 stdout=subprocess.PIPE,
@@ -1357,31 +1564,50 @@ raise SystemExit(2 if failed else 0)
                 env=environment,
             )
         except Exception:
-            self.run_button.Enable()
-            self.check_button.Enable()
-            self.stop_button.Disable()
-            if self.process_log_handle is not None:
-                self.process_log_handle.close()
-                self.process_log_handle = None
+            if log_handle is not None:
+                log_handle.close()
             raise
 
-        self.process_thread = threading.Thread(target=self.read_process_output, daemon=True)
-        self.process_thread.start()
+        record: dict[str, Any] = {
+            "seq": seq,
+            "popen": popen,
+            "thread": None,
+            "task": task,
+            "log_handle": log_handle,
+            "stop_requested": False,
+            "remote_job_id": None,
+            "workdir": workdir,
+            "is_remote": is_remote,
+        }
+        self.processes.append(record)
+        record["thread"] = threading.Thread(
+            target=self.read_process_output, args=(record,), daemon=True
+        )
+        record["thread"].start()
+        self.update_controls()
 
-    def read_process_output(self) -> None:
-        assert self.process is not None
-        process = self.process
-        assert process.stdout is not None
-        for line in process.stdout:
-            wx.CallAfter(self.handle_process_line, line)
-            if self.process_log_handle is not None:
-                self.process_log_handle.write(line)
-                self.process_log_handle.flush()
-        return_code = process.wait()
-        wx.CallAfter(self.process_finished, return_code)
+    def read_process_output(self, record: dict[str, Any]) -> None:
+        popen = record["popen"]
+        assert popen.stdout is not None
+        for line in popen.stdout:
+            wx.CallAfter(self.handle_process_line, record, line)
+            log_handle = record.get("log_handle")
+            if log_handle is not None:
+                log_handle.write(line)
+                log_handle.flush()
+        return_code = popen.wait()
+        wx.CallAfter(self.process_finished, record, return_code)
 
-    def handle_process_line(self, line: str) -> None:
-        self.append_log(line)
+    def handle_process_line(self, record: dict[str, Any], line: str) -> None:
+        job_match = re.search(r"\[REMOTE\] Slurm JobID:\s*(\d+)", line)
+        if job_match:
+            record["remote_job_id"] = job_match.group(1)
+        if len(self.processes) > 1 and line.strip():
+            self.append_log(f"[#{record['seq']}] " + line)
+        else:
+            self.append_log(line)
+        if not self.processes or record is not self.processes[-1]:
+            return
         progress_match = re.search(r"\b(\d{1,3})%\|", line)
         if progress_match:
             self.progress.SetValue(min(100, int(progress_match.group(1))))
@@ -1397,41 +1623,42 @@ raise SystemExit(2 if failed else 0)
         ]
         for needle, label in stages:
             if needle in lower:
-                self.status_text.SetLabel(label)
-                self.SetStatusText(label)
+                self.status_text.SetLabel(f"[#{record['seq']}] {label}")
+                self.SetStatusText(f"[#{record['seq']}] {label}")
                 if "calculating" in needle:
                     self.progress.SetValue(0)
                 break
 
-    def process_finished(self, return_code: int) -> None:
-        task = self.process_task
-        stopped = self.stop_requested
-        self.process = None
-        self.process_thread = None
-        if self.process_log_handle is not None:
-            self.process_log_handle.close()
-            self.process_log_handle = None
-        self.run_button.Enable()
-        self.check_button.Enable()
-        self.stop_button.Disable()
+    def process_finished(self, record: dict[str, Any], return_code: int) -> None:
+        seq = record["seq"]
+        task = record["task"]
+        stopped = record["stop_requested"]
+        if record in self.processes:
+            self.processes.remove(record)
+        log_handle = record.get("log_handle")
+        if log_handle is not None:
+            log_handle.close()
+            record["log_handle"] = None
+        self.update_controls()
         self.progress.SetValue(100 if return_code == 0 else 0)
 
         if stopped:
-            message = f"Stopped (exit code {return_code})"
+            message = f"[#{seq}] Stopped (exit code {return_code})"
             self.status_text.SetLabel(message)
             self.SetStatusText(message)
             self.append_log(f"\n[GUI] {message}\n")
             return
 
         if return_code == 0:
-            message = "Environment check passed" if task == "environment" else "Completed successfully"
+            done = "Environment check passed" if task == "environment" else "Completed successfully"
+            message = f"[#{seq}] {done}"
             self.status_text.SetLabel(message)
             self.SetStatusText(message)
             self.append_log(f"\n[GUI] {message}.\n")
             if task == "workflow":
-                self.load_summary_after_run()
+                self.load_summary_after_run(workdir=record.get("workdir"))
         else:
-            message = f"Process failed with exit code {return_code}"
+            message = f"[#{seq}] Process failed with exit code {return_code}"
             self.status_text.SetLabel(message)
             self.SetStatusText(message)
             self.append_log(f"\n[GUI] {message}.\n")
@@ -1439,17 +1666,21 @@ raise SystemExit(2 if failed else 0)
             # summary parser returned nonzero, show the scientifically valid
             # result rather than hiding it.
             if task == "workflow":
-                self.load_summary_after_run(silent=True)
+                self.load_summary_after_run(silent=True, workdir=record.get("workdir"))
             wx.Bell()
 
-    def load_summary_after_run(self, *, silent: bool = False) -> None:
-        if self.last_workdir is None:
+    def load_summary_after_run(
+        self, *, silent: bool = False, workdir: Path | None = None
+    ) -> None:
+        if workdir is None:
+            workdir = self.last_workdir
+        if workdir is None:
             return
-        result = self.last_workdir / "FINAL_RESULTS_MMPBSA.dat"
+        result = workdir / "FINAL_RESULTS_MMPBSA.dat"
         if not result.is_file():
             return
         try:
-            summary_path = self.last_workdir / "binding_energy_summary.json"
+            summary_path = workdir / "binding_energy_summary.json"
             if summary_path.is_file():
                 summary = json.loads(summary_path.read_text(encoding="utf-8"))
             else:

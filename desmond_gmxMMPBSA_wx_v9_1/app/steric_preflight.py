@@ -31,7 +31,7 @@ except ImportError as exc:  # pragma: no cover - dependency check
         "ParmEd is required for steric preflight. Activate the gmx_MMPBSA environment."
     ) from exc
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 @dataclass(frozen=True)
@@ -370,6 +370,31 @@ def write_outputs(workdir: Path, result: dict[str, object], suffix: str = "") ->
         writer.writerows(records)
 
 
+def finalize_cap_repair_report(workdir: Path, result: dict[str, object]) -> None:
+    """Record the authoritative topology-aware result in the repair report."""
+
+    path = workdir / "cap_clash_repair.json"
+    if not path.is_file():
+        return
+    report = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    if not isinstance(report, dict):
+        raise ValueError("cap_clash_repair.json must contain an object")
+    geometric_passed = bool(
+        report.get("geometric_hard_clash_target_met", report.get("validation_passed", False))
+    )
+    report["geometric_hard_clash_target_met"] = geometric_passed
+    report["topology_aware_validation_passed"] = bool(result["validation_passed"])
+    report["validation_passed"] = bool(result["validation_passed"])
+    report["validation_authority"] = "Amber topology-aware Lennard-Jones preflight"
+    report["topology_aware_global_minimum_interacting_pair"] = result[
+        "global_minimum_interacting_pair"
+    ]
+    report["topology_aware_global_maximum_positive_pair_lj"] = result[
+        "global_maximum_positive_pair_lj"
+    ]
+    path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+
 def run_cap_repair(
     workdir: Path,
     repair_script: Path,
@@ -399,6 +424,10 @@ def run_cap_repair(
         "--output-xtc", output_xtc,
         "--allow-no-caps",
         "--backup-and-replace",
+        # The geometric distance is an optimization target, not the final
+        # safety gate.  This caller immediately rescans the installed result
+        # with COM.prmtop Lennard-Jones parameters and Amber exclusions.
+        "--defer-hard-clash-validation",
         "--trigger-clash-nm", trigger,
         "--hard-clash-nm", hard,
         "--maximum-tilt-deg", tilt,
@@ -485,6 +514,8 @@ def main() -> int:
     result["repair_history"] = repair_history
     result["automatic_coordinate_changes_limited_to_synthetic_caps"] = True
     write_outputs(workdir, result, "")
+    if repair_history:
+        finalize_cap_repair_report(workdir, result)
     print(json.dumps(result, indent=2))
 
     if not bool(result["validation_passed"]):

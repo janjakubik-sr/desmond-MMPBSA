@@ -1,0 +1,70 @@
+Change log — Desmond GRO/XTC → gmx_MMPBSA wx miniapp
+====================================================
+
+GUI 1.2.0 (2026-10-22)
+----------------------
+
+Concurrent remote submissions
+
+- Multiple remote (Slurm) workflows may run at the same time: the GUI now
+  tracks a list of process records instead of a single process. A further
+  remote submission is allowed whenever no local workflow occupies the
+  machine; local workflows remain exclusive.
+- Each process gets a sequence tag shown in the log header, status bar and
+  finish messages; while two or more processes are active, streamed log
+  lines are prefixed with their tag.
+- Progress bar and stage labels follow the most recently started job.
+- Every remote job's Slurm JobID is tracked per process; **Stop** cancels
+  all active processes (`scancel` for each parsed JobID plus SIGTERM/
+  SIGKILL of each local process group), and closing the window stops all.
+- Result-summary auto-loading uses the work directory of the job that has
+  just finished.
+
+GUI 1.1.0 (2026-10-16)
+----------------------
+
+Remote Slurm execution (new module ``remote_alkyone.py``)
+
+- New *Remote execution* checkbox on the Calculation tab
+  (*Complete workflow* and *Run an existing prepared directory*).
+- On submission the GUI writes two scripts into the work directory:
+  a local driver (``alkyone_remote.sh``) that allocates a scratch
+  directory on the server, uploads the workflow engine and the job
+  script, and hands over SSH; and ``alkyone_job.sh`` running on the
+  server which stages the inputs off the shared mount, submits the
+  engine via ``sbatch``, streams the job log back live, copies all
+  results back to the mounted work directory, and propagates the job's
+  exit code. The scratch directory is removed on success and kept for
+  inspection on failure.
+- New Advanced-tab fields: **Remote SSH host**, **Remote Slurm
+  partition**, **Remote Slurm walltime**, **Remote scratch base**,
+  **Remote conda executable**; all persisted in settings and profiles.
+  Defaults: host ``alkyone``, partition ``LocalQ``, walltime
+  ``48:00:00``, scratch ``/scratch/roshi``, conda
+  ``~/miniconda3/bin/conda``.
+- *Check environment* probes the server over SSH when remote execution
+  is active (``gmx``, ``sbatch``/``squeue``/``sacct``, and the remote
+  conda environment's Python modules and executables).
+- *Show command* displays the remote submission summary.
+- Slurm header uses ``--ntasks=<MPI> --cpus-per-task=1`` so that
+  OpenMPI/PRRTE (used by gmx_MMPBSA) sees one slot per MPI rank;
+  ``--cpus-per-task=N`` with a single task previously triggered the
+  "not enough slots" error.
+- *Stop* additionally issues ``ssh <host> scancel <jobid>`` for remote
+  workflows.
+
+Helper scripts synced from the working installation
+
+- ``app/steric_preflight.py`` 1.2.0: adds
+  ``finalize_cap_repair_report()`` recording the authoritative
+  topology-aware validation result in ``cap_clash_repair.json``.
+- ``app/repair_synthetic_caps.py``: renamed determination-by-atom
+  exclusion structure (``excluded_by_atom``) and new
+  ``--defer-hard-clash-validation`` option for pipelines running an
+  authoritative topology-aware validation immediately afterwards.
+
+GUI 1.0.6 / engine 9.1.0
+------------------------
+
+See ``RELEASE_NOTES_v9_1.md`` and ``VALIDATION_v9_1.md`` for the engine
+9.1 work-directory state correction and earlier changes.

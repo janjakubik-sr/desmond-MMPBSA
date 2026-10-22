@@ -1,6 +1,6 @@
 # Desmond GRO/XTC → gmx_MMPBSA wxPython miniapp
 
-**GUI version:** 1.0.6  
+**GUI version:** 1.2.0  
 **Scientific workflow engine:** 9.1.0, retaining the validated version-9 topology-aware preflight and version-8 atom-mapping workflow
 
 This package adds a wxPython desktop interface to the open-source workflow that:
@@ -15,6 +15,38 @@ This package adds a wxPython desktop interface to the open-source workflow that:
 8. runs single-trajectory gmx_MMPBSA and displays/saves the final ΔTOTAL statistics.
 
 
+
+## Remote Slurm execution (GUI 1.1+)
+
+The GUI can submit calculations to a remote server through Slurm instead of
+running them locally. Enable **Run on a remote server via Slurm** on the
+Calculation tab (available for *Complete workflow* and *Run an existing
+prepared directory*). The server must be reachable by password-less SSH and
+share the data directory at the same absolute path (for example an sshfs
+mount such as `/home/roshi/Data`).
+
+On submission the GUI writes two scripts into the work directory:
+
+- `alkyone_remote.sh` — a local driver that allocates a scratch directory on
+  the server (default `/scratch/roshi/wxmmpbsa_XXXXXXXXXX`), uploads the
+  workflow engine and the job script, and hands the session over SSH;
+- `alkyone_job.sh` — runs on the server: it stages the inputs off the shared
+  mount (Slurm jobs never compute on the mount), submits the engine with
+  `sbatch` (`--ntasks=<MPI> --cpus-per-task=1`, so OpenMPI/PRRTE sees one
+  slot per rank), streams `job.log` back live, copies all results back to
+  the mounted work directory, and exits with the job's own status. The
+  scratch directory is removed on success and kept for inspection on
+  failure.
+
+Server settings on the Advanced tab (persisted in settings/profiles):
+**Remote SSH host**, **Remote Slurm partition**, **Remote Slurm walltime**,
+**Remote scratch base**, **Remote conda executable**. *Check environment*
+probes the server over SSH when remote execution is enabled, and *Stop*
+additionally issues `scancel` for the submitted Slurm job.
+
+Since GUI 1.2, several remote workflows may be queued/running concurrently
+(local runs remain exclusive). Concurrent log lines are tagged `[#1]`,
+`[#2]`, … in the log window, and **Stop** cancels all active processes.
 
 ## Engine 9.1 work-directory state correction
 
@@ -287,7 +319,9 @@ Available parameters include:
 - Conda executable and environment name;
 - current-Python versus `conda run` execution;
 - workflow-engine path;
-- additional expert command-line arguments.
+- additional expert command-line arguments;
+- remote execution settings: SSH host, Slurm partition and walltime,
+  remote scratch base, and remote conda executable.
 
 ## Execution and monitoring
 
@@ -299,6 +333,8 @@ The GUI:
 - tracks gmx_MMPBSA percentage output and calculation stage;
 - writes `wx_gui_run.log` into the work directory;
 - can terminate the complete subprocess group, including MPI workers;
+- can queue multiple concurrent remote Slurm submissions and cancels
+  their jobs with `scancel` when stopped;
 - stores the last settings under `~/.config/desmond_gmxmmpbsa_wx/settings.json`;
 - supports reusable JSON profiles.
 

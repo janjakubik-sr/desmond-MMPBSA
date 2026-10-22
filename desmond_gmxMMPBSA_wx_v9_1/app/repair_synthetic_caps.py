@@ -61,7 +61,7 @@ class CapDefinition:
     axis_atom: int
     anchor_atom: int
     movable_atoms: tuple[int, ...]
-    excluded_atoms: frozenset[int]
+    excluded_by_atom: tuple[frozenset[int], ...]
 
 
 def parse_args() -> argparse.Namespace:
@@ -139,7 +139,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backup-and-replace",
         action="store_true",
-        help="Back up and replace the original PDB/XTC after successful validation",
+        help="Back up and replace the original PDB/XTC after the repair is accepted",
+    )
+    parser.add_argument(
+        "--defer-hard-clash-validation",
+        action="store_true",
+        help=(
+            "Write and optionally install the best geometric repair even if it "
+            "misses --hard-clash-nm; intended only when an authoritative "
+            "topology-aware validation is run immediately afterward"
+        ),
     )
     parser.add_argument(
         "--allow-no-caps",
@@ -215,7 +224,16 @@ def identify_caps(
                 f"{residue_name}{residue.resSeq} axis atom has {len(external)} external bonds; expected 1"
             )
         movable = tuple(index for index in atom_indices if index != axis_atom)
-        excluded = graph_neighborhood(atom_indices, adjacency, depth=3)
+        # Nonbonded exclusions are pair-specific.  A cap-wide neighborhood is
+        # incorrect here: for example, an atom three bonds from the ACE carbonyl
+        # can still be four bonds from the ACE methyl carbon and therefore is an
+        # interacting 1-5 pair for that methyl carbon.  Exclude only 1-2 and 1-3
+        # pairs.  Amber evaluates 1-4 pairs with scaling, so retaining them in
+        # this approximate geometric score is deliberately conservative.
+        excluded_by_atom = tuple(
+            graph_neighborhood((atom_index,), adjacency, depth=2)
+            for atom_index in atom_indices
+        )
         caps.append(
             CapDefinition(
                 residue_index=residue.index,
@@ -225,7 +243,7 @@ def identify_caps(
                 axis_atom=axis_atom,
                 anchor_atom=external[0],
                 movable_atoms=movable,
-                excluded_atoms=excluded,
+                excluded_by_atom=excluded_by_atom,
             )
         )
     return caps
@@ -319,20 +337,26 @@ def _score_candidates(
     environment_indices: np.ndarray,
     radii: np.ndarray,
     hard_clash_nm: float,
+    excluded_pairs: np.ndarray,
 ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
     """Select a candidate, prioritizing clearance of the hard-clash cutoff."""
 
     delta = candidates[:, :, None, :] - environment_xyz[None, None, :, :]
     distances = np.linalg.norm(delta, axis=3)
+    if excluded_pairs.shape != distances.shape[1:]:
+        raise ValueError(
+            "Pair-exclusion mask does not match cap/environment atom dimensions"
+        )
+    interacting_distances = np.where(excluded_pairs[None, :, :], np.inf, distances)
     radii_sum = (
         radii[cap_atom_indices][None, :, None]
         + radii[environment_indices][None, None, :]
     )
-    ratio = radii_sum / np.maximum(distances, 0.02)
+    ratio = radii_sum / np.maximum(interacting_distances, 0.02)
     penalties = np.where(ratio > 0.75, ratio**12, 0.0)
     scores = np.sum(penalties, axis=(1, 2))
-    minimum_distance = np.min(distances, axis=(1, 2))
-    minimum_scaled = np.min(distances / radii_sum, axis=(1, 2))
+    minimum_distance = np.min(interacting_distances, axis=(1, 2))
+    minimum_scaled = np.min(interacting_distances / radii_sum, axis=(1, 2))
 
     safe = np.flatnonzero(minimum_distance >= hard_clash_nm)
     if safe.size:
@@ -384,17 +408,25 @@ def optimize_cap_frame(
     base_vectors = xyz[cap_atoms] - origin
 
     distance_to_anchor = np.linalg.norm(xyz - origin, axis=1)
+    cap_atom_set = set(cap.atom_indices)
     environment = np.asarray(
         [
             index
             for index, distance in enumerate(distance_to_anchor)
-            if distance <= environment_radius_nm and index not in cap.excluded_atoms
+            if distance <= environment_radius_nm and index not in cap_atom_set
         ],
         dtype=int,
     )
     if environment.size == 0:
         return 0.0, 0.0, 0.0, "none", 0.0, math.inf, -1, -1
     environment_xyz = xyz[environment]
+    excluded_pairs = np.asarray(
+        [
+            [environment_atom in excluded for environment_atom in environment]
+            for excluded in cap.excluded_by_atom
+        ],
+        dtype=bool,
+    )
 
     # Stage 1: rotate around the original anchor-axis bond.  Including the
     # axis atom is harmless because its vector lies on the rotation axis.
@@ -406,6 +438,7 @@ def optimize_cap_frame(
         environment,
         radii,
         hard_clash_nm,
+        excluded_pairs,
     )
     best_coords = candidates[best]
     best_score = float(scores[best])
@@ -447,6 +480,7 @@ def optimize_cap_frame(
                     environment,
                     radii,
                     hard_clash_nm,
+                    excluded_pairs,
                 )
                 candidate_min = float(local_minimum[local_best])
                 candidate_score = float(local_scores[local_best])
@@ -525,6 +559,7 @@ def optimize_cap_frame(
                         environment,
                         radii,
                         hard_clash_nm,
+                        excluded_pairs,
                     )
                     candidate_min = float(local_minimum[local_best])
                     candidate_score = float(local_scores[local_best])
@@ -586,15 +621,26 @@ def cap_minimum_contact(
     cap: CapDefinition,
 ) -> tuple[float, int, int]:
     cap_atoms = np.asarray(cap.atom_indices, dtype=int)
+    cap_atom_set = set(cap.atom_indices)
     environment = np.asarray(
-        [index for index in range(xyz.shape[0]) if index not in cap.excluded_atoms],
+        [index for index in range(xyz.shape[0]) if index not in cap_atom_set],
         dtype=int,
     )
     delta = xyz[cap_atoms][:, None, :] - xyz[environment][None, :, :]
     distances = np.linalg.norm(delta, axis=2)
-    local_pair = np.unravel_index(int(np.argmin(distances)), distances.shape)
+    excluded_pairs = np.asarray(
+        [
+            [environment_atom in excluded for environment_atom in environment]
+            for excluded in cap.excluded_by_atom
+        ],
+        dtype=bool,
+    )
+    interacting_distances = np.where(excluded_pairs, np.inf, distances)
+    local_pair = np.unravel_index(
+        int(np.argmin(interacting_distances)), interacting_distances.shape
+    )
     return (
-        float(distances[local_pair]),
+        float(interacting_distances[local_pair]),
         int(cap_atoms[local_pair[0]]),
         int(environment[local_pair[1]]),
     )
@@ -853,6 +899,12 @@ def main() -> int:
         "cap_frame_combinations_repaired": sum(bool(row["repaired"]) for row in rows),
         "repair_required": any(bool(row["repaired"]) for row in rows),
         "validation_passed": after_global[0] >= args.hard_clash_nm,
+        "geometric_hard_clash_target_met": after_global[0] >= args.hard_clash_nm,
+        "validation_authority": (
+            "topology-aware steric preflight deferred"
+            if args.defer_hard_clash_validation
+            else "geometric hard-clash threshold"
+        ),
         "topology_and_atom_order_unchanged": True,
         "noncap_coordinates_unchanged": True,
     }
@@ -867,7 +919,7 @@ def main() -> int:
             handle.write("\t".join(str(row[column]) for column in columns) + "\n")
 
     print(json.dumps(report, indent=2))
-    if not report["validation_passed"]:
+    if not report["validation_passed"] and not args.defer_hard_clash_validation:
         raise RuntimeError(
             "Cap repair did not remove every hard clash: minimum after repair is "
             f"{after_global[0]:.6f} nm"

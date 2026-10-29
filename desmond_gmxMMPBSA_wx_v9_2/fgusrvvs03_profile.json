@@ -1,0 +1,12 @@
+{
+  "mode": "all",
+  "run_remote": true,
+  "remote_host": "fgusrvvs03",
+  "remote_user": "jakubik",
+  "remote_partition": "CPU_job_Q",
+  "remote_walltime": "48:00:00",
+  "remote_scratch": "/scratch/jakubik",
+  "remote_conda": "~/miniforge3/bin/conda",
+  "remote_rsync_stage": true,
+  "conda_env": "desmond-mmpbsa"
+}

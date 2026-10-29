@@ -1,0 +1,416 @@
+--- /mnt/data/v9src/desmond_gmxMMPBSA_wx_v9/app/desmond_gmxmmpbsa.py	2026-07-31 13:41:06.000000000 +0000
++++ /mnt/data/v9_1build/app/desmond_gmxmmpbsa.py	2026-07-31 14:47:04.273580556 +0000
+@@ -22,6 +22,7 @@
+ 
+ import argparse
+ import csv
++import hashlib
+ import json
+ import math
+ import os
+@@ -29,6 +30,7 @@
+ import shutil
+ import subprocess
+ import sys
++import time
+ import unicodedata
+ import xml.etree.ElementTree as ET
+ from collections import Counter, defaultdict, deque
+@@ -40,7 +42,7 @@
+ import networkx as nx
+ import numpy as np
+ 
+-__version__ = "9.0.0"
++__version__ = "9.1.0"
+ 
+ AA_NAMES = {
+     "ALA", "ARG", "ASN", "ASP", "ASH", "CYS", "CYM", "CYX", "GLN",
+@@ -1815,6 +1817,76 @@
+             )
+ 
+ 
++def file_sha256(path: Path) -> str:
++    """Return a stable SHA-256 digest for a prepared input file."""
++
++    digest = hashlib.sha256()
++    with path.open("rb") as handle:
++        for block in iter(lambda: handle.read(1024 * 1024), b""):
++            digest.update(block)
++    return digest.hexdigest()
++
++
++def files_are_identical(left: Path, right: Path) -> bool:
++    if not left.is_file() or not right.is_file():
++        return False
++    if left.stat().st_size != right.stat().st_size:
++        return False
++    return file_sha256(left) == file_sha256(right)
++
++
++def archive_stale_preparation_state(outdir: Path) -> Path | None:
++    """Archive state that must never be reused by a fresh prepare command.
++
++    A fresh prepare into an existing directory writes new base PDB/XTC files.
++    Old cap-repair reports and capfixed coordinates then refer to the previous
++    preparation.  Keeping those files under their live names allowed a stale
++    ``validation_passed`` report to suppress cap repair.  Move the prior state
++    aside before generating new coordinates.
++    """
++
++    exact_names = {
++        "preparation_report.json",
++        "cap_clash_repair.json",
++        "cap_rotation_angles.tsv",
++        "steric_preflight.json",
++        "steric_preflight_before.json",
++        "steric_clashes.tsv",
++        "steric_clashes_before.tsv",
++        "steric_preflight.stdout.log",
++        "undefined_energy_report.json",
++        "FINAL_RESULTS_MMPBSA.dat",
++        "FINAL_RESULTS_MMPBSA.csv",
++        "binding_energy_summary.json",
++        "binding_energy_summary_warning.json",
++    }
++    patterns = (
++        "*_capfix.pdb",
++        "*_capfix.xtc",
++        "*_stericfix*.pdb",
++        "*_stericfix*.xtc",
++        "*.before_capfix",
++    )
++    candidates = {outdir / name for name in exact_names}
++    for pattern in patterns:
++        candidates.update(outdir.glob(pattern))
++    existing = sorted(path for path in candidates if path.exists())
++    if not existing:
++        return None
++
++    timestamp = time.strftime("%Y%m%d_%H%M%S")
++    archive = outdir / "previous_run_state" / timestamp
++    counter = 1
++    while archive.exists():
++        archive = outdir / "previous_run_state" / f"{timestamp}_{counter}"
++        counter += 1
++    archive.mkdir(parents=True, exist_ok=False)
++    for path in existing:
++        destination = archive / path.name
++        shutil.move(str(path), str(destination))
++    return archive
++
++
+ def parse_pdb_atoms(path: Path) -> list[dict[str, object]]:
+     atoms: list[dict[str, object]] = []
+     with path.open("rt", encoding="utf-8", errors="replace") as handle:
+@@ -1904,6 +1976,9 @@
+         if not path.is_file():
+             raise FileNotFoundError(path)
+     outdir.mkdir(parents=True, exist_ok=True)
++    archived_state = archive_stale_preparation_state(outdir)
++    if archived_state is not None:
++        print(f"Archived stale prior-run state in {archived_state}")
+ 
+     _title, all_atoms, gro_box = parse_gro(gro)
+     raw_protein_blocks = contiguous_residue_blocks(all_atoms, AA_NAMES)
+@@ -3809,21 +3884,14 @@
+ 
+ 
+ def apply_synthetic_cap_clash_repair(outdir: Path) -> dict[str, object]:
+-    """Run the bundled cap optimizer after trajectory preparation.
++    """Generate and select validated synthetic-cap coordinates.
+ 
+-    The topology and atom order are unchanged.  Only ACE/NME atoms in frames
+-    with nonbonded contacts below 0.15 nm can rotate about their peptide anchor
+-    bond.  Safe systems therefore remain coordinate-identical.
++    The repaired PDB/XTC are kept as explicit ``*_capfix`` files and the run
++    manifest is updated to reference them.  The base prepared coordinates are
++    left immutable.  A prior report is reused only when its output files still
++    exist and are demonstrably associated with the current preparation.
+     """
+ 
+-    existing_report_path = outdir / "cap_clash_repair.json"
+-    if existing_report_path.is_file():
+-        existing_report = json.loads(
+-            existing_report_path.read_text(encoding="utf-8", errors="replace")
+-        )
+-        if bool(existing_report.get("validation_passed", False)):
+-            return existing_report
+-
+     repair_script = Path(__file__).with_name("repair_synthetic_caps.py")
+     if not repair_script.is_file():
+         raise FileNotFoundError(
+@@ -3838,27 +3906,114 @@
+     prepared_files = preparation_report.get("files", {})
+     if not isinstance(prepared_files, dict):
+         raise ValueError("Invalid preparation_report.json: files must be an object")
++
+     input_pdb_name = str(prepared_files.get("complex_pdb", "complex_amber_order.pdb"))
+     input_xtc_name = str(prepared_files.get("complex_xtc", "complex_stride10.xtc"))
+-    input_pdb_path = Path(input_pdb_name)
+-    input_xtc_path = Path(input_xtc_name)
++    input_pdb_path = outdir / Path(input_pdb_name).name
++    input_xtc_path = outdir / Path(input_xtc_name).name
++
++    existing_report_path = outdir / "cap_clash_repair.json"
++    if existing_report_path.is_file():
++        existing_report = json.loads(
++            existing_report_path.read_text(encoding="utf-8", errors="replace")
++        )
++        if bool(existing_report.get("validation_passed", False)):
++            caps = existing_report.get("caps", [])
++            if not caps:
++                preparation_report["synthetic_cap_clash_repair"] = existing_report
++                preparation_report["miniapp_version"] = __version__
++                preparation_report_path.write_text(
++                    json.dumps(preparation_report, indent=2) + "\n", encoding="utf-8"
++                )
++                return existing_report
++
++            reported_pdb = outdir / Path(str(existing_report.get("output_pdb", ""))).name
++            reported_xtc = outdir / Path(str(existing_report.get("output_xtc", ""))).name
++            manifest_uses_reported = (
++                Path(input_pdb_name).name == reported_pdb.name
++                and Path(input_xtc_name).name == reported_xtc.name
++            )
++            if manifest_uses_reported and reported_pdb.is_file() and reported_xtc.is_file():
++                preparation_report["synthetic_cap_clash_repair"] = existing_report
++                preparation_report["miniapp_version"] = __version__
++                preparation_report_path.write_text(
++                    json.dumps(preparation_report, indent=2) + "\n", encoding="utf-8"
++                )
++                return existing_report
++
++            # Compatibility recovery for folders produced by versions 4-9:
++            # those versions replaced the base files and retained both a
++            # pre-capfix backup and a separate validated capfix output.  A
++            # later prepare could overwrite the base files while leaving the
++            # old report.  Reuse is safe only when the current base files are
++            # byte-identical to the recorded backups.
++            backup_pdb = input_pdb_path.with_suffix(input_pdb_path.suffix + ".before_capfix")
++            backup_xtc = input_xtc_path.with_suffix(input_xtc_path.suffix + ".before_capfix")
++            if (
++                reported_pdb.is_file()
++                and reported_xtc.is_file()
++                and files_are_identical(input_pdb_path, backup_pdb)
++                and files_are_identical(input_xtc_path, backup_xtc)
++            ):
++                prepared_files["complex_pdb"] = reported_pdb.name
++                prepared_files["complex_xtc"] = reported_xtc.name
++                existing_report["recovered_from_overwritten_active_files"] = True
++                existing_report["selected_pdb_sha256"] = file_sha256(reported_pdb)
++                existing_report["selected_xtc_sha256"] = file_sha256(reported_xtc)
++                preparation_report["files"] = prepared_files
++                preparation_report["synthetic_cap_clash_repair"] = existing_report
++                preparation_report["miniapp_version"] = __version__
++                preparation_report_path.write_text(
++                    json.dumps(preparation_report, indent=2) + "\n", encoding="utf-8"
++                )
++                existing_report_path.write_text(
++                    json.dumps(existing_report, indent=2) + "\n", encoding="utf-8"
++                )
++                print(
++                    "Recovered validated capfixed PDB/XTC after the base files "
++                    "were overwritten by a later prepare run."
++                )
++                return existing_report
++
++        # The report cannot be tied safely to the current input files.  Keep
++        # it for audit and generate a fresh repair.
++        timestamp = time.strftime("%Y%m%d_%H%M%S")
++        stale = existing_report_path.with_name(
++            existing_report_path.name + f".stale.{timestamp}"
++        )
++        existing_report_path.rename(stale)
++
++    # If the manifest currently points to a prior capfix name but no reusable
++    # report exists, return to the immutable base preparation before creating
++    # a new capfix file.
++    base_pdb = outdir / "complex_amber_order.pdb"
++    if base_pdb.is_file() and "_capfix" in input_pdb_path.stem:
++        input_pdb_path = base_pdb
++        input_pdb_name = base_pdb.name
++    base_xtc_candidates = sorted(
++        path for path in outdir.glob("complex_stride*.xtc")
++        if "_capfix" not in path.stem and "_stericfix" not in path.stem
++    )
++    if base_xtc_candidates and "_capfix" in input_xtc_path.stem:
++        input_xtc_path = base_xtc_candidates[0]
++        input_xtc_name = input_xtc_path.name
++
++    if not input_pdb_path.is_file():
++        raise FileNotFoundError(input_pdb_path)
++    if not input_xtc_path.is_file():
++        raise FileNotFoundError(input_xtc_path)
++
+     output_pdb_name = f"{input_pdb_path.stem}_capfix{input_pdb_path.suffix}"
+     output_xtc_name = f"{input_xtc_path.stem}_capfix{input_xtc_path.suffix}"
+     command = [
+         sys.executable,
+         str(repair_script),
+-        "--workdir",
+-        str(outdir),
+-        "--pdb",
+-        input_pdb_name,
+-        "--xtc",
+-        input_xtc_name,
+-        "--output-pdb",
+-        output_pdb_name,
+-        "--output-xtc",
+-        output_xtc_name,
++        "--workdir", str(outdir),
++        "--pdb", input_pdb_name,
++        "--xtc", input_xtc_name,
++        "--output-pdb", output_pdb_name,
++        "--output-xtc", output_xtc_name,
+         "--allow-no-caps",
+-        "--backup-and-replace",
+     ]
+     subprocess.run(command, check=True)
+     repair_report_path = outdir / "cap_clash_repair.json"
+@@ -3868,11 +4023,28 @@
+     if not bool(repair_report.get("validation_passed", False)):
+         raise RuntimeError("Synthetic-cap clash validation failed")
+ 
++    if repair_report.get("caps"):
++        output_pdb = outdir / output_pdb_name
++        output_xtc = outdir / output_xtc_name
++        if not output_pdb.is_file() or not output_xtc.is_file():
++            raise RuntimeError("Validated cap-repair outputs are missing")
++        prepared_files["complex_pdb"] = output_pdb.name
++        prepared_files["complex_xtc"] = output_xtc.name
++        repair_report["selected_pdb_sha256"] = file_sha256(output_pdb)
++        repair_report["selected_xtc_sha256"] = file_sha256(output_xtc)
++    else:
++        prepared_files["complex_pdb"] = input_pdb_path.name
++        prepared_files["complex_xtc"] = input_xtc_path.name
++
++    preparation_report["files"] = prepared_files
+     preparation_report["synthetic_cap_clash_repair"] = repair_report
+     preparation_report["miniapp_version"] = __version__
+     preparation_report_path.write_text(
+         json.dumps(preparation_report, indent=2) + "\n", encoding="utf-8"
+     )
++    repair_report_path.write_text(
++        json.dumps(repair_report, indent=2) + "\n", encoding="utf-8"
++    )
+     return repair_report
+ 
+ 
+
+--- steric_preflight.py ---
+--- /mnt/data/v9src/desmond_gmxMMPBSA_wx_v9/app/steric_preflight.py	2026-07-31 13:44:17.000000000 +0000
++++ /mnt/data/v9_1build/app/steric_preflight.py	2026-07-31 14:45:13.229576910 +0000
+@@ -31,7 +31,7 @@
+         "ParmEd is required for steric preflight. Activate the gmx_MMPBSA environment."
+     ) from exc
+ 
+-VERSION = "1.0.1"
++VERSION = "1.1.0"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -434,43 +434,53 @@
+     write_outputs(workdir, result, "_before")
+ 
+     repair_history: list[dict[str, object]] = []
+-    if not bool(result["validation_passed"]) and not args.no_repair:
+-        if bool(result["unsafe_source_pair_present"]):
+-            # A synthetic cap may coexist with a source clash, but source
+-            # coordinates must never be changed automatically.
+-            pass
+-        elif bool(result["unsafe_synthetic_cap_pair_present"]):
+-            repair_script = (
+-                Path(args.repair_script).expanduser().resolve()
+-                if args.repair_script
+-                else Path(__file__).with_name("repair_synthetic_caps.py")
++    if (
++        not bool(result["validation_passed"])
++        and not args.no_repair
++        and bool(result["unsafe_synthetic_cap_pair_present"])
++    ):
++        # Repair synthetic-cap pairs first, even when the frame-wide heuristic
++        # also flags source atoms.  The repair script is restricted to atoms
++        # explicitly marked as synthetic caps.  After each pass, rescan the
++        # complete system; any genuine source-only clash remains and causes a
++        # hard stop below.
++        repair_script = (
++            Path(args.repair_script).expanduser().resolve()
++            if args.repair_script
++            else Path(__file__).with_name("repair_synthetic_caps.py")
++        )
++        if not repair_script.is_file():
++            raise FileNotFoundError(repair_script)
++        for pass_number in (1, 2):
++            run_cap_repair(workdir, repair_script, pdb, xtc, pass_number)
++            repaired = scan(
++                workdir, pdb, xtc, prmtop, report,
++                args.cutoff_nm, args.pair_limit_kcal, args.frame_limit_kcal,
++                args.hard_distance_nm, args.top_pairs,
++            )
++            repair_history.append(
++                {
++                    "pass": pass_number,
++                    "validation_passed": repaired["validation_passed"],
++                    "global_maximum_positive_pair_lj": repaired[
++                        "global_maximum_positive_pair_lj"
++                    ],
++                    "global_minimum_interacting_pair": repaired[
++                        "global_minimum_interacting_pair"
++                    ],
++                    "unsafe_source_pair_present": repaired[
++                        "unsafe_source_pair_present"
++                    ],
++                    "unsafe_synthetic_cap_pair_present": repaired[
++                        "unsafe_synthetic_cap_pair_present"
++                    ],
++                }
+             )
+-            if not repair_script.is_file():
+-                raise FileNotFoundError(repair_script)
+-            for pass_number in (1, 2):
+-                run_cap_repair(workdir, repair_script, pdb, xtc, pass_number)
+-                repaired = scan(
+-                    workdir, pdb, xtc, prmtop, report,
+-                    args.cutoff_nm, args.pair_limit_kcal, args.frame_limit_kcal,
+-                    args.hard_distance_nm, args.top_pairs,
+-                )
+-                repair_history.append(
+-                    {
+-                        "pass": pass_number,
+-                        "validation_passed": repaired["validation_passed"],
+-                        "global_maximum_positive_pair_lj": repaired[
+-                            "global_maximum_positive_pair_lj"
+-                        ],
+-                        "global_minimum_interacting_pair": repaired[
+-                            "global_minimum_interacting_pair"
+-                        ],
+-                    }
+-                )
+-                result = repaired
+-                if bool(result["validation_passed"]):
+-                    break
+-                if bool(result["unsafe_source_pair_present"]):
+-                    break
++            result = repaired
++            if bool(result["validation_passed"]):
++                break
++            if not bool(result["unsafe_synthetic_cap_pair_present"]):
++                break
+ 
+     result["repair_history"] = repair_history
+     result["automatic_coordinate_changes_limited_to_synthetic_caps"] = True
+
+--- GUI ---
+--- /mnt/data/v9src/desmond_gmxMMPBSA_wx_v9/desmond_gmxmmpbsa_wx.py	2026-07-31 13:44:47.000000000 +0000
++++ /mnt/data/v9_1build/desmond_gmxmmpbsa_wx.py	2026-07-31 14:45:13.229576910 +0000
+@@ -40,8 +40,8 @@
+     raise SystemExit(1) from exc
+ 
+ 
+-GUI_VERSION = "1.0.5"
+-ENGINE_VERSION = "9.0.0"
++GUI_VERSION = "1.0.6"
++ENGINE_VERSION = "9.1.0"
+ APP_TITLE = "Desmond → gmx_MMPBSA"
+ CONFIG_DIR = Path.home() / ".config" / "desmond_gmxmmpbsa_wx"
+ SETTINGS_FILE = CONFIG_DIR / "settings.json"

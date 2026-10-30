@@ -1,6 +1,63 @@
 Change log — Desmond GRO/XTC → gmx_MMPBSA wx miniapp
 ====================================================
 
+GUI 1.3.0 / engine 9.1.4 (2026-10-30)
+-------------------------------------
+
+Duplicate-H caps on internal peptide residues (engine 9.1.3/9.1.4)
+
+- Source systems spliced from fusion-protein constructs can carry an
+  sp3-like backbone nitrogen mid-chain: the residue keeps two N-H
+  hydrogens while its N is covalently joined to the preceding peptide
+  carbonyl (observed at MET345 of the M4 5DSG construct, where the
+  freely rotatable CA-C-N-CA torsion samples a different omega in
+  every replica). The strict amide gates (backbone angles, trans
+  omega, planar retained hydrogen) rejected some MD frames of that
+  pathology, the excess H was then reinterpreted as a neutral
+  N-terminal cap, and the workflow aborted with ``Duplicate-H cap on
+  internal residue (345, 'MET'); expected a segment N terminus``.
+- ``internal_duplicate_nh_correction`` now decides bondedness with the
+  same C-N criterion the segment detector uses (0.20 nm), so the
+  internal-versus-terminal classification can never contradict the
+  segment boundary validation. Backbone angles and omega are recorded
+  in ``internal_backbone_hydrogen_corrections.tsv`` for the audit
+  trail but no longer gate the classification. The retained hydrogen
+  is chosen by O-C-N-H planarity when computable, otherwise by the
+  conventional amide atom name; degenerate geometry records NaN
+  through new ``_safe_angle``/``_safe_dihedral`` helpers.
+- The preparation stage prints a consolidated WARNING when a
+  corrected residue is not amide-like (non-trans omega, non-planar
+  retained hydrogen, or C-N outside the covalent range), stating
+  that the excess hydrogen was removed because the terminal-cap
+  interpretation is impossible for a peptide-joined residue.
+- New regression test ``tests/test_internal_duplicate_nh_nonplanar.py``
+  built from the real GLN344/MET345 frames of the failing M4 jobs
+  (non-planar hydrogen pair; non-amide omega).
+
+Host-named remote submission scripts
+
+- ``remote_run.py`` derives the driver/job script names from the SSH
+  target host (for example ``fgusrvvs03_remote.sh`` /
+  ``fgusrvvs03_job.sh``) instead of the historical fixed
+  ``alkyone_*`` names, so a work directory never holds scripts named
+  after the wrong server. Covered by the new
+  ``tests/test_remote_script_naming.py``.
+
+engine 9.1.2 (2026-10-29)
+-------------------------
+
+Degenerate chain-break residue handling
+
+- A residue key can cover several disconnected molecular fragments
+  after upstream structure editing (a backbone carbonyl carbon
+  carrying two capping hydrogens with the CA atom deleted). Such
+  debris cannot be represented by any ff19SB template and is now
+  excluded from the rescoring receptor model in the new default
+  ``drop`` mode with an explicit warning, or aborts in the strict
+  ``error`` mode. New GUI choice *Degenerate chain-break residue*
+  wiring the ``--degenerate-residue-mode`` engine flag.
+- New regression test ``tests/test_degenerate_residue_drop.py``.
+
 GUI 1.3.0 / engine 9.1.1 (2026-10-29)
 -------------------------------------
 

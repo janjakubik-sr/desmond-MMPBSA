@@ -18,7 +18,7 @@ assert spec and spec.loader
 engine = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = engine
 spec.loader.exec_module(engine)
-assert engine.__version__ == "9.1.1"
+assert engine.__version__ == "9.1.4"
 
 with tempfile.TemporaryDirectory() as directory:
     workdir = Path(directory)

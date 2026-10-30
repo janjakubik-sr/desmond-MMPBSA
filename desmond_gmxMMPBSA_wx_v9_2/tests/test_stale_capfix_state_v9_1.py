@@ -58,7 +58,7 @@ with tempfile.TemporaryDirectory() as directory:
     report = json.loads((workdir / "preparation_report.json").read_text())
     assert report["files"]["complex_pdb"] == fixed_pdb.name
     assert report["files"]["complex_xtc"] == fixed_xtc.name
-    assert report["miniapp_version"] == "9.1.1"
+    assert report["miniapp_version"] == "9.1.4"
     # Base files remain immutable; only the manifest selects repaired data.
     assert base_pdb.read_bytes() == b"BASE-PDB"
     assert base_xtc.read_bytes() == b"BASE-XTC"

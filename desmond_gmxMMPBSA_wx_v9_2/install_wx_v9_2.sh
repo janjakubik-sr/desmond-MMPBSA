@@ -41,5 +41,5 @@ install -m 0755 "$SOURCE_ROOT/run_desmond_gmxmmpbsa.sh" "$TARGET_ROOT/run_desmon
 install -m 0755 "$SOURCE_ROOT/run_capfixed_recovery.sh" "$TARGET_ROOT/run_capfixed_recovery.sh"
 install -m 0755 "$SOURCE_ROOT/run_gmx_structure_route.sh" "$TARGET_ROOT/run_gmx_structure_route.sh"
 
-printf '\nInstalled engine 9.1.1 and wxPython GUI 1.3.0 (remote_run.py) into:\n  %s\n\n' "$TARGET_ROOT"
+printf '\nInstalled engine 9.1.4 and wxPython GUI 1.3.0 (remote_run.py) into:\n  %s\n\n' "$TARGET_ROOT"
 printf 'Launch with:\n  %s/run_desmond_gmxmmpbsa_wx.sh\n' "$TARGET_ROOT"

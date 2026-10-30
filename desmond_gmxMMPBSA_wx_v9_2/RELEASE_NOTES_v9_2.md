@@ -1,4 +1,4 @@
-Release notes — v9.2 (engine 9.1.1 / GUI 1.3.0), 2026-10-29
+Release notes — v9.2 (engine 9.1.4 / GUI 1.3.0), 2026-10-29–30
 ============================================================
 
 Focus: remote execution on servers without the shared Data mount
@@ -35,3 +35,32 @@ Verification: engine/GUI unit tests re-run for the new version strings
 unchanged); remote rsync staging was exercised end-to-end on `fgusrvvs03`
 through its Slurm queue (`CPU_job_Q`), including input push, live log
 streaming, result pull-back and scratch cleanup.
+
+Post-release engine updates within v9.2 (2026-10-29–30)
+--------------------------------------------------------
+
+**Engine 9.1.2** adds degenerate chain-break residue handling: a residue
+key covering disconnected fragments (carbonyl C with two capping
+hydrogens, CA deleted) is dropped from the ff19SB receptor model in the
+default `drop` mode or aborts in `error` mode, driven by the new
+*Degenerate chain-break residue* GUI choice and
+`--degenerate-residue-mode` flag.
+
+**Engine 9.1.3/9.1.4** fix duplicate-H caps on internal peptide residues
+(M4 5DSG MET345: an sp3-like backbone N bonded to the preceding carbonyl
+yet carrying two N-H hydrogens). Bondedness now uses the segment
+detector's C-N criterion (0.20 nm), amide geometry is advisory and
+recorded, and the retained hydrogen is chosen by O-C-N-H planarity or
+conventional naming. Regression tests use the real frames of the three
+failing M4 jobs.
+
+**remote_run.py** derives the driver/job script names from the SSH
+target host (`fgusrvvs03_remote.sh` / `fgusrvvs03_job.sh`) instead of the
+fixed `alkyone_*` names.
+
+Verification: all engine/GUI unit tests pass for the new version strings;
+`prepare` was exercised end-to-end on all three M4 replicates
+(`desmond_md_job_1/2/3`), confirming the MET345 internal correction
+(removed/retained hydrogens recorded in
+`internal_backbone_hydrogen_corrections.tsv`) and the HIE24→ACE /
+ARG427→NME terminal caps.

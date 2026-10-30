@@ -42,7 +42,7 @@ import mdtraj as md
 import networkx as nx
 import numpy as np
 
-__version__ = "9.1.1"
+__version__ = "9.1.4"
 
 AA_NAMES = {
     "ALA", "ARG", "ASN", "ASP", "ASH", "CYS", "CYM", "CYX", "GLN",
@@ -152,6 +152,26 @@ class InternalBackboneHydrogenCorrection:
     omega_deg: float
     retained_o_c_n_h_dihedral_deg: float | None
     removed_o_c_n_h_dihedral_deg: float
+
+
+@dataclass
+class DegenerateResidueDrop:
+    """A source residue excluded from the ff19SB model as chain-break debris.
+
+    Upstream structure editing can remove a residue's backbone atoms (for
+    example the CA/HA of a chain-break stub) and cap the dangling bonds with
+    hydrogens.  The residue key then covers several disconnected molecular
+    fragments - a protonated amine, a doubly hydrogen-capped carbonyl, a
+    re-protonated side-chain stump - that no ff19SB template can represent
+    and that are not peptide-connected to any neighbouring residue.  Such a
+    residue is excluded from the rescoring receptor like solvent instead of
+    aborting the whole workflow.
+    """
+
+    residue_key: tuple[int, str]
+    carbonyl_hydrogen_names: list[str]
+    atom_count: int
+    reason: str
 
 
 @dataclass
@@ -359,6 +379,37 @@ def dihedral_degrees(
     return math.degrees(math.atan2(float(np.dot(np.cross(b1, v), w)), float(np.dot(v, w))))
 
 
+def _safe_angle(
+    a: np.ndarray | None,
+    b: np.ndarray | None,
+    c: np.ndarray | None,
+) -> float:
+    """Return the A-B-C angle in degrees, or NaN when not computable."""
+
+    if a is None or b is None or c is None:
+        return float("nan")
+    try:
+        return angle_degrees(a, b, c)
+    except ValueError:
+        return float("nan")
+
+
+def _safe_dihedral(
+    a: np.ndarray | None,
+    b: np.ndarray | None,
+    c: np.ndarray | None,
+    d: np.ndarray | None,
+) -> float:
+    """Return the A-B-C-D dihedral in degrees, or NaN when not computable."""
+
+    if a is None or b is None or c is None or d is None:
+        return float("nan")
+    try:
+        return dihedral_degrees(a, b, c, d)
+    except ValueError:
+        return float("nan")
+
+
 def internal_duplicate_nh_correction(
     previous: ResidueBlock | None,
     current: ResidueBlock,
@@ -369,12 +420,18 @@ def internal_duplicate_nh_correction(
     """Classify an extra backbone-N hydrogen on an internal peptide residue.
 
     A two-hydrogen backbone N is normally interpreted as a neutral N terminus.
-    That interpretation is wrong when the residue is already joined to the
-    preceding carbonyl.  We require peptide-like C-N distance, backbone bond
-    angles, and a trans omega dihedral.  For an ordinary amino acid, the
-    retained hydrogen is the one whose O-C-N-H dihedral is closest to 180
-    degrees, i.e. the planar amide hydrogen.  Ambiguous cases are left for the
-    terminal-cap logic or a strict mapping error rather than guessed.
+    That interpretation is wrong when the residue is covalently joined to the
+    preceding carbonyl.  Bondedness uses the same criterion as segment
+    detection (C-N within 0.20 nm), so a residue can never be reinterpreted as
+    a terminus that the segment boundary validation would later reject.
+
+    Backbone bond angles and the omega dihedral no longer gate the
+    classification.  A source nitrogen that carries an excess hydrogen is
+    sp3-like, so the CA-C-N-CA torsion is freely rotatable and neither
+    amide-like angles nor a trans omega can be required of it; the measured
+    values are still recorded for the audit trail.  The retained hydrogen is
+    the one whose O-C-N-H dihedral is closest to 180 degrees when that
+    scoring is computable, and otherwise the conventional amide atom name.
     """
 
     if previous is None or len(n_hydrogens) != ordinary_count + 1:
@@ -396,38 +453,47 @@ def internal_duplicate_nh_correction(
     }
     if "OXT" in previous_lookup:
         return None
-    required_previous = {"CA", "C", "O"}
-    required_current = {"N", "CA"}
-    if not required_previous.issubset(previous_lookup) or not required_current.issubset(current_lookup):
+    if "C" not in previous_lookup or "N" not in current_lookup:
         return None
 
     carbon = previous_lookup["C"].xyz_nm
-    previous_ca = carbon + minimum_image(previous_lookup["CA"].xyz_nm - carbon, box)
-    oxygen = carbon + minimum_image(previous_lookup["O"].xyz_nm - carbon, box)
     nitrogen = carbon + minimum_image(current_lookup["N"].xyz_nm - carbon, box)
-    current_ca = nitrogen + minimum_image(current_lookup["CA"].xyz_nm - nitrogen, box)
-
     c_n_distance = float(np.linalg.norm(nitrogen - carbon))
-    if not 0.115 <= c_n_distance <= 0.170:
+    if c_n_distance > 0.20:
         return None
 
-    ca_c_n_angle = angle_degrees(previous_ca, carbon, nitrogen)
-    c_n_ca_angle = angle_degrees(carbon, nitrogen, current_ca)
-    omega = dihedral_degrees(previous_ca, carbon, nitrogen, current_ca)
-    omega_deviation = abs(180.0 - abs(omega))
-    if not (90.0 <= ca_c_n_angle <= 145.0):
-        return None
-    if not (95.0 <= c_n_ca_angle <= 145.0):
-        return None
-    if omega_deviation > 45.0:
-        return None
+    # Advisory geometry: measured where the required atoms exist, never
+    # decisive.  Degenerate arrangements (collinear or coincident atoms)
+    # record NaN instead of failing the correction.
+    previous_ca = (
+        carbon + minimum_image(previous_lookup["CA"].xyz_nm - carbon, box)
+        if "CA" in previous_lookup
+        else None
+    )
+    oxygen = (
+        carbon + minimum_image(previous_lookup["O"].xyz_nm - carbon, box)
+        if "O" in previous_lookup
+        else None
+    )
+    current_ca = (
+        nitrogen + minimum_image(current_lookup["CA"].xyz_nm - nitrogen, box)
+        if "CA" in current_lookup
+        else None
+    )
+    ca_c_n_angle = _safe_angle(previous_ca, carbon, nitrogen)
+    c_n_ca_angle = _safe_angle(carbon, nitrogen, current_ca)
+    omega = _safe_dihedral(previous_ca, carbon, nitrogen, current_ca)
+
+    def h_dihedral(hydrogen: GroAtom) -> float:
+        if oxygen is None:
+            return float("nan")
+        hydrogen_xyz = nitrogen + minimum_image(hydrogen.xyz_nm - nitrogen, box)
+        return _safe_dihedral(oxygen, carbon, nitrogen, hydrogen_xyz)
 
     if ordinary_count == 0:
         # Internal proline has no N-H.  One source N-H on a peptide-connected
         # proline is therefore the excess atom.
         removed = n_hydrogens[0]
-        removed_xyz = nitrogen + minimum_image(removed.xyz_nm - nitrogen, box)
-        removed_dihedral = dihedral_degrees(oxygen, carbon, nitrogen, removed_xyz)
         return InternalBackboneHydrogenCorrection(
             residue_key=(current.source_resid, current.source_resname),
             previous_residue_key=(previous.source_resid, previous.source_resname),
@@ -438,28 +504,34 @@ def internal_duplicate_nh_correction(
             c_n_ca_angle_deg=c_n_ca_angle,
             omega_deg=omega,
             retained_o_c_n_h_dihedral_deg=None,
-            removed_o_c_n_h_dihedral_deg=removed_dihedral,
+            removed_o_c_n_h_dihedral_deg=h_dihedral(removed),
         )
 
     if ordinary_count != 1 or len(n_hydrogens) != 2:
         return None
 
-    scored: list[tuple[float, float, GroAtom]] = []
-    for hydrogen in n_hydrogens:
-        hydrogen_xyz = nitrogen + minimum_image(hydrogen.xyz_nm - nitrogen, box)
-        dihedral = dihedral_degrees(oxygen, carbon, nitrogen, hydrogen_xyz)
-        score = abs(180.0 - abs(dihedral))
-        scored.append((score, dihedral, hydrogen))
-    scored.sort(key=lambda item: (item[0], item[2].source_index))
-
-    best_score, retained_dihedral, retained = scored[0]
-    second_score, removed_dihedral, removed = scored[1]
     # A standard peptide amide hydrogen is nearly trans to the carbonyl O.
-    # Require both a good retained geometry and a clear distinction between
-    # the two candidates.  This prevents arbitrary deletion at ambiguous
-    # termini or malformed structures.
-    if best_score > 35.0 or second_score - best_score < 25.0:
-        return None
+    # Prefer the more planar candidate whenever the dihedrals are computable;
+    # otherwise fall back to the conventional amide atom name.  Either way one
+    # hydrogen must be omitted: a peptide-joined residue cannot be a segment
+    # N terminus, so the terminal-cap interpretation is impossible.
+    dihedrals = [h_dihedral(hydrogen) for hydrogen in n_hydrogens]
+    if all(not math.isnan(value) for value in dihedrals):
+        scored = sorted(
+            zip(dihedrals, n_hydrogens),
+            key=lambda item: (abs(180.0 - abs(item[0])), item[1].source_index),
+        )
+        retained, removed = scored[0][1], scored[1][1]
+        retained_dihedral = h_dihedral(retained)
+        removed_dihedral = h_dihedral(removed)
+    else:
+        conventional = [
+            atom for atom in n_hydrogens if atom.source_name.upper() == "H"
+        ]
+        retained = conventional[0] if conventional else n_hydrogens[0]
+        removed = next(atom for atom in n_hydrogens if atom is not retained)
+        retained_dihedral = h_dihedral(retained)
+        removed_dihedral = h_dihedral(removed)
 
     return InternalBackboneHydrogenCorrection(
         residue_key=(current.source_resid, current.source_resname),
@@ -476,11 +548,14 @@ def internal_duplicate_nh_correction(
 
 
 def separate_noncontiguous_hydrogen_caps(
-    blocks: Sequence[ResidueBlock], box: np.ndarray
+    blocks: Sequence[ResidueBlock],
+    box: np.ndarray,
+    degenerate_residue_mode: str = "drop",
 ) -> tuple[
     list[ResidueBlock],
     dict[tuple[int, str], list[HydrogenCap]],
     list[InternalBackboneHydrogenCorrection],
+    list[DegenerateResidueDrop],
 ]:
     """Extract neutral chain-break hydrogens from protein residues.
 
@@ -495,6 +570,12 @@ def separate_noncontiguous_hydrogen_caps(
     other N-H direction as the per-frame ACE placement anchor.  A fully
     protonated free N terminus (three N-H atoms for ordinary residues, two for
     PRO) is retained and mapped to the ff19SB N-terminal template.
+
+    A residue whose backbone carbonyl carbon carries two C-bound hydrogens
+    and no CA atom is chain-break editing debris (see
+    ``DegenerateResidueDrop``).  With ``degenerate_residue_mode="drop"`` such a
+    residue key is excluded from the protein model; ``"error"`` restores the
+    strict behaviour of stopping the workflow.
     """
 
     atoms_by_key: dict[tuple[int, str], list[GroAtom]] = defaultdict(list)
@@ -508,6 +589,8 @@ def separate_noncontiguous_hydrogen_caps(
     normalized: list[ResidueBlock] = []
     caps: dict[tuple[int, str], list[HydrogenCap]] = defaultdict(list)
     internal_corrections: list[InternalBackboneHydrogenCorrection] = []
+    dropped: list[DegenerateResidueDrop] = []
+    kept_keys: list[tuple[int, str]] = []
 
     for key_position, key in enumerate(key_order):
         residue_atoms = list(atoms_by_key[key])
@@ -533,10 +616,35 @@ def separate_noncontiguous_hydrogen_caps(
                 if 0.07 <= distance <= 0.14:
                     hxt_atoms.append(atom)
         if len(hxt_atoms) > 1:
-            raise ValueError(
-                f"Multiple hydrogens bonded to backbone carbonyl C in residue {key}: "
-                f"{[atom.source_name for atom in hxt_atoms]}"
+            # Two C-bound hydrogens can only mean that both heavy neighbours
+            # of the carbonyl carbon (CA and the next peptide N, or CA and
+            # OXT) were removed upstream and each dangling bond was capped
+            # with a hydrogen.  If the residue still has its CA the atom set
+            # is chemically impossible rather than chain-break debris, so the
+            # strict error is kept for that case.
+            has_backbone_ca = any(
+                atom.source_name.upper() == "CA" for atom in residue_atoms
             )
+            if has_backbone_ca or degenerate_residue_mode == "error":
+                raise ValueError(
+                    f"Multiple hydrogens bonded to backbone carbonyl C in residue {key}: "
+                    f"{[atom.source_name for atom in hxt_atoms]}"
+                )
+            dropped.append(
+                DegenerateResidueDrop(
+                    residue_key=key,
+                    carbonyl_hydrogen_names=[
+                        atom.source_name for atom in hxt_atoms
+                    ],
+                    atom_count=len(residue_atoms),
+                    reason=(
+                        "backbone carbonyl C carries two capping hydrogens and the "
+                        "residue has no CA atom; upstream editing left disconnected "
+                        "molecular fragments under this residue key"
+                    ),
+                )
+            )
+            continue
         if hxt_atoms:
             residue_atoms.remove(hxt_atoms[0])
 
@@ -549,8 +657,8 @@ def separate_noncontiguous_hydrogen_caps(
 
         if len(n_hydrogens) == ordinary_count + 1:
             previous_block = None
-            if key_position > 0:
-                previous_key = key_order[key_position - 1]
+            if kept_keys:
+                previous_key = kept_keys[-1]
                 previous_block = ResidueBlock(
                     previous_key[0],
                     previous_key[1],
@@ -668,8 +776,9 @@ def separate_noncontiguous_hydrogen_caps(
             )
 
         normalized.append(main)
+        kept_keys.append(key)
 
-    return normalized, dict(caps), internal_corrections
+    return normalized, dict(caps), internal_corrections, dropped
 
 def assign_hydrogen_caps_to_segment_boundaries(
     residues: Sequence[ResidueBlock],
@@ -1996,7 +2105,19 @@ def prepare_workflow(args: argparse.Namespace) -> Path:
         protein_residues,
         hydrogen_caps,
         internal_hydrogen_corrections,
-    ) = separate_noncontiguous_hydrogen_caps(raw_protein_blocks, gro_box)
+        dropped_degenerate_residues,
+    ) = separate_noncontiguous_hydrogen_caps(
+        raw_protein_blocks,
+        gro_box,
+        degenerate_residue_mode=args.degenerate_residue_mode,
+    )
+    for drop in dropped_degenerate_residues:
+        print(
+            f"WARNING: excluding degenerate chain-break residue "
+            f"{drop.residue_key[1]}{drop.residue_key[0]} ({drop.atom_count} atoms, "
+            f"carbonyl hydrogens {drop.carbonyl_hydrogen_names}) from the ff19SB "
+            f"receptor model: {drop.reason}"
+        )
     if internal_hydrogen_corrections and args.internal_duplicate_h_mode == "error":
         labels = [
             f"{item.residue_key[1]}{item.residue_key[0]} "
@@ -2010,6 +2131,35 @@ def prepare_workflow(args: argparse.Namespace) -> Path:
             + ". Re-run with --internal-duplicate-h-mode planar-remove "
             "to retain the planar amide H and omit the excess atom."
         )
+    for correction in internal_hydrogen_corrections:
+        notes: list[str] = []
+        if not 0.115 <= correction.c_n_distance_nm <= 0.170:
+            notes.append(
+                f"C-N {correction.c_n_distance_nm:.3f} nm is outside the "
+                "covalent range"
+            )
+        omega = correction.omega_deg
+        if not math.isnan(omega):
+            omega_offset = min(
+                abs(180.0 - abs(omega)), abs(abs(omega))
+            )
+            if omega_offset > 45.0:
+                notes.append(f"omega {omega:.1f} deg is not amide-like")
+        if correction.retained_o_c_n_h_dihedral_deg is not None:
+            planarity = abs(180.0 - abs(correction.retained_o_c_n_h_dihedral_deg))
+            if planarity > 35.0:
+                notes.append(
+                    f"the retained amide hydrogen is {planarity:.1f} deg from "
+                    "planar trans"
+                )
+        if notes:
+            print(
+                f"WARNING: residue {correction.residue_key[1]}{correction.residue_key[0]} "
+                "is peptide-connected but its source backbone nitrogen is not "
+                "amide-like (" + "; ".join(notes) + "); the excess hydrogen was "
+                "removed anyway because the terminal-cap interpretation is "
+                "impossible for a peptide-joined residue"
+            )
     if not protein_residues:
         raise ValueError("No Amber-compatible protein residues were found in the GRO")
 
@@ -2714,6 +2864,17 @@ def prepare_workflow(args: argparse.Namespace) -> Path:
         "solvent_model": args.solvent_model,
         "hydrogen_cap_mode": args.hydrogen_cap_mode,
         "internal_duplicate_h_mode": args.internal_duplicate_h_mode,
+        "degenerate_residue_mode": args.degenerate_residue_mode,
+        "dropped_degenerate_residues": [
+            {
+                "source_resid": drop.residue_key[0],
+                "source_resname": drop.residue_key[1],
+                "atom_count": drop.atom_count,
+                "carbonyl_hydrogen_names": drop.carbonyl_hydrogen_names,
+                "reason": drop.reason,
+            }
+            for drop in dropped_degenerate_residues
+        ],
         "protein_atoms": n_protein,
         "protein_source_atoms_retained": len(expected_source_protein),
         "protein_source_cap_hydrogens_replaced": len(synthetic_caps),
@@ -4103,6 +4264,17 @@ def add_prepare_arguments(parser: argparse.ArgumentParser) -> None:
             "How to handle a peptide-connected internal residue carrying one "
             "excess backbone-N hydrogen: retain the planar amide H and omit "
             "the excess source H from ff19SB rescoring (default), or stop."
+        ),
+    )
+    parser.add_argument(
+        "--degenerate-residue-mode",
+        choices=("drop", "error"),
+        default="drop",
+        help=(
+            "How to handle a source residue whose backbone carbonyl carries two "
+            "C-bound hydrogens and no CA atom (chain-break editing debris): "
+            "exclude the residue from the ff19SB rescoring model (default) "
+            "or stop with an error."
         ),
     )
 

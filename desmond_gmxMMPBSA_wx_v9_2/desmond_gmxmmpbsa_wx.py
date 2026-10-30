@@ -43,7 +43,7 @@ except ImportError as exc:  # pragma: no cover - depends on the desktop system
 
 
 GUI_VERSION = "1.3.0"
-ENGINE_VERSION = "9.1.1"
+ENGINE_VERSION = "9.1.4"
 APP_TITLE = "Desmond → gmx_MMPBSA"
 CONFIG_DIR = Path.home() / ".config" / "desmond_gmxmmpbsa_wx"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
@@ -711,6 +711,8 @@ class MainFrame(wx.Frame):
         self.cap_mode.SetSelection(0)
         self.internal_h_mode = wx.Choice(panel, choices=["planar-remove", "error"])
         self.internal_h_mode.SetSelection(0)
+        self.degenerate_residue_mode = wx.Choice(panel, choices=["drop", "error"])
+        self.degenerate_residue_mode.SetSelection(0)
         self.ffxml_file = PathField(
             panel,
             wildcard="OpenMM force-field XML (*.xml)|*.xml|All files (*.*)|*.*",
@@ -754,6 +756,7 @@ class MainFrame(wx.Frame):
             ("Ligand charges", self.preserve_ligand_charges),
             ("Hydrogen-cap handling", self.cap_mode),
             ("Internal duplicate N-H", self.internal_h_mode),
+            ("Degenerate chain-break residue", self.degenerate_residue_mode),
             ("Protein ff19SB XML", self.ffxml_file),
             ("Conda/Miniforge executable", self.conda_file),
             ("Conda environment", self.conda_env),
@@ -883,6 +886,7 @@ class MainFrame(wx.Frame):
             "preserve_ligand_charges": self.preserve_ligand_charges.GetValue(),
             "cap_mode": self.cap_mode.GetStringSelection(),
             "internal_h_mode": self.internal_h_mode.GetStringSelection(),
+            "degenerate_residue_mode": self.degenerate_residue_mode.GetStringSelection(),
             "ffxml": self.ffxml_file.get(),
             "conda": self.conda_file.get(),
             "conda_env": self.conda_env.GetValue().strip(),
@@ -920,6 +924,10 @@ class MainFrame(wx.Frame):
         self.cap_mode.SetSelection(max(0, self.cap_mode.FindString(cap_mode)))
         internal_mode = str(data.get("internal_h_mode", "planar-remove"))
         self.internal_h_mode.SetSelection(max(0, self.internal_h_mode.FindString(internal_mode)))
+        degenerate_mode = str(data.get("degenerate_residue_mode", "drop"))
+        self.degenerate_residue_mode.SetSelection(
+            max(0, self.degenerate_residue_mode.FindString(degenerate_mode))
+        )
         self.ffxml_file.set(data.get("ffxml", self.ffxml_default))
         saved_conda = str(data.get("conda", "")).strip()
         try:
@@ -986,6 +994,7 @@ class MainFrame(wx.Frame):
         self.preserve_ligand_charges.Enable(prepare_inputs)
         self.cap_mode.Enable(prepare_inputs)
         self.internal_h_mode.Enable(prepare_inputs)
+        self.degenerate_residue_mode.Enable(prepare_inputs)
         self.ffxml_file.enable(prepare_inputs)
         self.mpi_processes.Enable(mode in {"all", "run"})
         self.workdir.enable(mode != "summarize")
@@ -1399,6 +1408,7 @@ class MainFrame(wx.Frame):
                 "--solvent-model", self.solvent_model.GetStringSelection().lower(),
                 "--hydrogen-cap-mode", self.cap_mode.GetStringSelection(),
                 "--internal-duplicate-h-mode", self.internal_h_mode.GetStringSelection(),
+                "--degenerate-residue-mode", self.degenerate_residue_mode.GetStringSelection(),
             ]
             if charge_text:
                 command += ["--ligand-charge", charge_text]
@@ -1527,6 +1537,7 @@ class MainFrame(wx.Frame):
             if fields["stage_mode"] == remote_run.STAGE_MODE_RSYNC
             else "shared Data mount on the server"
         )
+        driver_name, job_name = remote_run.script_names(fields["host"])
         return (
             f"Remote execution on {fields['host']} via Slurm\n\n"
             f"SSH user:   {fields['user'] or '(SSH config default)'}\n"
@@ -1540,8 +1551,8 @@ class MainFrame(wx.Frame):
             f"back to:\n{workdir}\n\n"
             f"Local driver command:\n{format_command(command)}\n\n"
             f"Generated scripts:\n"
-            f"  {workdir / remote_run.DRIVER_SCRIPT_NAME}\n"
-            f"  {workdir / remote_run.JOB_SCRIPT_NAME}"
+            f"  {workdir / driver_name}\n"
+            f"  {workdir / job_name}"
         )
 
     # ------------------------------ subprocess management ----------------
